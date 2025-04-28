@@ -1,0 +1,427 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PSAI</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body {
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .card {
+            margin-bottom: 20px;
+            border-radius: 10px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        }
+        .result-card {
+            margin-top: 10px;
+            border-left: 4px solid #6c757d;
+            padding-left: 10px;
+        }
+        .metadata {
+            font-size: 0.8rem;
+            color: #6c757d;
+        }
+        .collection-tag {
+            font-size: 0.75rem;
+            padding: 2px 8px;
+            border-radius: 12px;
+            background-color: #e9ecef;
+            display: inline-block;
+            margin-right: 5px;
+        }
+        #response-container {
+            border-radius: 10px;
+            background-color: #fff;
+            padding: 20px;
+            margin-top: 20px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        }
+        .settings-card {
+            background-color: #f8f9fa;
+            border-radius: 10px;
+            margin-bottom: 20px;
+        }
+        .loading {
+            text-align: center;
+            margin: 20px 0;
+            display: none;
+        }
+        .spinner-border {
+            width: 3rem;
+            height: 3rem;
+        }
+        #gemini-response em {
+            font-style: italic;
+        }
+        #gemini-response strong {
+            font-weight: bold;
+        }
+        #gemini-response ol, #gemini-response ul {
+            padding-left: 20px;
+        }
+        .tips-button {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            z-index: 1000;
+        }
+        .modal-body ul {
+            padding-left: 20px;
+        }
+        .tip-section {
+            margin-bottom: 15px;
+        }
+        .tip-title {
+            font-weight: bold;
+            color: #0d6efd;
+        }
+    </style>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+</head>
+<body>
+    <div class="container">
+        <h1 class="mt-4 mb-4 text-center">Phyllis AI Prototype</h1>
+        
+        <div class="row">
+            <div class="col-lg-4">
+                <div class="card settings-card">
+                    <div class="card-body">
+                        <h5 class="card-title">Settings</h5>
+                        
+                        <form id="queryForm">
+                            <div class="mb-3">
+                                <label for="collections" class="form-label">Collections</label>
+                                <div id="collections-container">
+                                    {% for collection in collections %}
+                                    <div class="form-check">
+                                        <input class="form-check-input collection-checkbox" type="checkbox" value="{{ collection }}" id="collection-{{ collection }}">
+                                        <label class="form-check-label" for="collection-{{ collection }}">
+                                            {{ collection }}
+                                        </label>
+                                    </div>
+                                    {% endfor %}
+                                </div>
+                                <div class="mt-2">
+                                    <button type="button" id="selectAll" class="btn btn-sm btn-outline-primary">Select All</button>
+                                    <button type="button" id="deselectAll" class="btn btn-sm btn-outline-secondary">Deselect All</button>
+                                </div>
+                            </div>
+                            
+                            <div class="mb-3">
+                                <label for="chunkLimit" class="form-label">Number of chunks: <span id="chunkLimitValue">5</span></label>
+                                <input type="range" class="form-range" min="1" max="20" step="1" id="chunkLimit" value="5">
+                            </div>
+                            
+                            <div class="mb-3">
+                                <label for="temperature" class="form-label">Temperature: <span id="temperatureValue">0.7</span></label>
+                                <input type="range" class="form-range" min="0" max="1" step="0.1" id="temperature" value="0.7">
+                            </div>
+                            
+                            <div class="mb-3">
+                                <label for="similarityThreshold" class="form-label">Similarity Threshold: <span id="similarityThresholdValue">0.0</span></label>
+                                <input type="range" class="form-range" min="0" max="1" step="0.05" id="similarityThreshold" value="0">
+                                <small class="text-muted">Higher values return only more relevant chunks (0 = no threshold)</small>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="col-lg-8">
+                <div class="card">
+                    <div class="card-body">
+                        <h5 class="card-title">Query</h5>
+                        <div class="mb-3">
+                            <textarea class="form-control" id="queryInput" rows="3" placeholder="Enter your query here..."></textarea>
+                        </div>
+                        <div class="d-grid">
+                            <button id="submitQuery" class="btn btn-primary">Submit</button>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="loading" id="loading">
+                    <div class="spinner-border text-primary" role="status">
+                        <span class="visually-hidden">Loading...</span>
+                    </div>
+                    <p>Processing your query...</p>
+                </div>
+                
+                <div id="response-container" style="display: none;">
+                    <h5>PS AI Response:</h5>
+                    <div id="gemini-response" class="mt-3"></div>
+                    
+                    <div class="mt-2 p-2 bg-light rounded">
+                        <h6>Token Information:</h6>
+                        <div id="token-info" class="d-flex">
+                            <div class="me-3">
+                                <span class="fw-bold">Input:</span> <span id="input-tokens">0</span>
+                            </div>
+                            <div class="me-3">
+                                <span class="fw-bold">Output:</span> <span id="output-tokens">0</span>
+                            </div>
+                            <div>
+                                <span class="fw-bold">Total:</span> <span id="total-tokens">0</span>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <hr>
+                    
+                    <div class="mt-4">
+                        <h5>Reference Chunks:</h5>
+                        <div id="chunks-container"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Helpful Tips Button -->
+    <button class="btn btn-info btn-lg rounded-circle tips-button" data-bs-toggle="modal" data-bs-target="#tipsModal">
+        <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" fill="currentColor" class="bi bi-question-lg" viewBox="0 0 16 16">
+            <path fill-rule="evenodd" d="M4.475 5.458c-.284 0-.514-.237-.47-.517C4.28 3.24 5.576 2 7.825 2c2.25 0 3.767 1.36 3.767 3.215 0 1.344-.665 2.288-1.79 2.973-1.1.659-1.414 1.118-1.414 2.01v.03a.5.5 0 0 1-.5.5h-.77a.5.5 0 0 1-.5-.495l-.003-.2c-.043-1.221.477-2.001 1.645-2.712 1.03-.632 1.397-1.135 1.397-2.028 0-.979-.758-1.698-1.926-1.698-1.009 0-1.71.529-1.938 1.402-.066.254-.278.461-.54.461h-.777ZM7.496 14c.622 0 1.095-.474 1.095-1.09 0-.618-.473-1.092-1.095-1.092-.606 0-1.087.474-1.087 1.091S6.89 14 7.496 14"/>
+        </svg>
+    </button>
+    
+    <!-- Helpful Tips Modal -->
+    <div class="modal fade" id="tipsModal" tabindex="-1" aria-labelledby="tipsModalLabel" aria-hidden="true">
+        <div class="modal-dialog modal-lg modal-dialog-scrollable">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title" id="tipsModalLabel">Helpful Tips for Using Phyllis AI</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body">
+                    <div class="tip-section">
+                        <p class="tip-title">Getting Started</p>
+                        <p>The Phyllis AI prototype is designed to answer questions based on the content in its collections. It will respond in the voice of Phyllis Schlafly based on her writings and other conservative sources.</p>
+                    </div>
+                    
+                    <div class="tip-section">
+                        <p class="tip-title">Collections</p>
+                        <ul>
+                            <li><strong>Select All:</strong> For best results, we recommend checking all collections to search across all available content.</li>
+                            <li>When specific topics are involved, you can narrow down to relevant collections.</li>
+                        </ul>
+                    </div>
+                    
+                    <div class="tip-section">
+                        <p class="tip-title">Number of Chunks</p>
+                        <ul>
+                            <li>This determines how many text segments from the collections will be used to generate the response.</li>
+                            <li><strong>More chunks (higher value):</strong> Provides more context but may include less relevant information.</li>
+                            <li><strong>Fewer chunks (lower value):</strong> More focused but might miss relevant information.</li>
+                            <li>The default of 5 chunks works well for most queries.</li>
+                        </ul>
+                    </div>
+                    
+                    <div class="tip-section">
+                        <p class="tip-title">Temperature</p>
+                        <ul>
+                            <li>Controls the creativity/randomness of the AI response.</li>
+                            <li><strong>Higher temperature (closer to 1.0):</strong> More creative, varied responses.</li>
+                            <li><strong>Lower temperature (closer to 0.0):</strong> More focused, deterministic responses.</li>
+                            <li>The default value of 0.7 provides a good balance.</li>
+                        </ul>
+                    </div>
+                    
+                    <div class="tip-section">
+                        <p class="tip-title">Similarity Threshold</p>
+                        <ul>
+                            <li>Determines how closely related text chunks must be to your query to be included.</li>
+                            <li><strong>Higher threshold:</strong> Only very relevant chunks will be included.</li>
+                            <li><strong>Zero threshold (0.0):</strong> Includes chunks regardless of relevance.</li>
+                            <li>Increase this value if you're getting irrelevant information in responses.</li>
+                        </ul>
+                    </div>
+                    
+                    <div class="tip-section">
+                        <p class="tip-title">Asking Effective Questions</p>
+                        <ul>
+                            <li><strong>Be specific:</strong> "What did Phyllis Schlafly say about the Equal Rights Amendment?" works better than "Tell me about equality."</li>
+                            <li><strong>Stay on topic:</strong> The AI can only answer questions related to content in its collections.</li>
+                            <li><strong>One question at a time:</strong> Ask single, focused questions rather than multiple questions in one query.</li>
+                            <li><strong>No chat history:</strong> Each query is independent - the AI doesn't remember previous questions or answers.</li>
+                            <li>If you want to follow up on a previous answer, include relevant information from that answer in your new question.</li>
+                        </ul>
+                    </div>
+                    
+                    <div class="tip-section">
+                        <p class="tip-title">Understanding Results</p>
+                        <ul>
+                            <li><strong>Reference Chunks:</strong> These show you the exact sources used for the response.</li>
+                            <li><strong>Citations:</strong> The response includes citations (like [REF_1]) to show which source material was used.</li>
+                            <li><strong>Token Information:</strong> Shows how much computational resources were used to generate the response.</li>
+                        </ul>
+                    </div>
+                    
+                    <div class="tip-section">
+                        <p class="tip-title">Limitations</p>
+                        <ul>
+                            <li>The AI can only answer based on the content in its collections.</li>
+                            <li>It cannot answer questions about topics not covered in the source materials.</li>
+                            <li>The AI is not a general chatbot - it's specifically focused on representing Phyllis Schlafly's views.</li>
+                            <li>Each query stands alone - there is no conversation history.</li>
+                        </ul>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            // Range sliders
+            const chunkLimit = document.getElementById('chunkLimit');
+            const chunkLimitValue = document.getElementById('chunkLimitValue');
+            const temperature = document.getElementById('temperature');
+            const temperatureValue = document.getElementById('temperatureValue');
+            const similarityThreshold = document.getElementById('similarityThreshold');
+            const similarityThresholdValue = document.getElementById('similarityThresholdValue');
+            
+            chunkLimit.addEventListener('input', function() {
+                chunkLimitValue.textContent = this.value;
+            });
+            
+            temperature.addEventListener('input', function() {
+                temperatureValue.textContent = this.value;
+            });
+            
+            similarityThreshold.addEventListener('input', function() {
+                similarityThresholdValue.textContent = this.value;
+            });
+            
+            // Collection selection buttons
+            const selectAll = document.getElementById('selectAll');
+            const deselectAll = document.getElementById('deselectAll');
+            const collectionCheckboxes = document.querySelectorAll('.collection-checkbox');
+            
+            selectAll.addEventListener('click', function() {
+                collectionCheckboxes.forEach(checkbox => {
+                    checkbox.checked = true;
+                });
+            });
+            
+            deselectAll.addEventListener('click', function() {
+                collectionCheckboxes.forEach(checkbox => {
+                    checkbox.checked = false;
+                });
+            });
+            
+            // Form submission
+            const submitButton = document.getElementById('submitQuery');
+            const queryInput = document.getElementById('queryInput');
+            const loading = document.getElementById('loading');
+            const responseContainer = document.getElementById('response-container');
+            const geminiResponse = document.getElementById('gemini-response');
+            const chunksContainer = document.getElementById('chunks-container');
+            
+            submitButton.addEventListener('click', async function() {
+                // Get selected collections
+                const selectedCollections = [];
+                collectionCheckboxes.forEach(checkbox => {
+                    if (checkbox.checked) {
+                        selectedCollections.push(checkbox.value);
+                    }
+                });
+                
+                // Validate inputs
+                if (!queryInput.value.trim()) {
+                    alert('Please enter a query');
+                    return;
+                }
+                
+                if (selectedCollections.length === 0) {
+                    alert('Please select at least one collection');
+                    return;
+                }
+                
+                // Show loading
+                loading.style.display = 'block';
+                responseContainer.style.display = 'none';
+                submitButton.disabled = true;
+                
+                // Prepare request data
+                const requestData = {
+                    query: queryInput.value.trim(),
+                    collections: selectedCollections,
+                    chunk_limit: parseInt(chunkLimit.value),
+                    temperature: parseFloat(temperature.value),
+                    similarity_threshold: parseFloat(similarityThreshold.value)
+                };
+                
+                try {
+                    // Send request
+                    const response = await fetch('/api/query', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify(requestData)
+                    });
+                    
+                    const data = await response.json();
+                    
+                    if (response.ok) {
+                        // Display response
+                        geminiResponse.innerHTML = marked.parse(data.response);
+                        
+                        // Display token information
+                        if (data.token_info) {
+                            document.getElementById('input-tokens').textContent = data.token_info.input_tokens || 0;
+                            document.getElementById('output-tokens').textContent = data.token_info.output_tokens || 0;
+                            document.getElementById('total-tokens').textContent = data.token_info.total_tokens || 0;
+                        }
+                        
+                        // Display chunks
+                        chunksContainer.innerHTML = '';
+                        data.chunks.forEach((chunk, index) => {
+                            const chunkDiv = document.createElement('div');
+                            chunkDiv.className = 'result-card';
+                            
+                            let metadataHtml = '';
+                            if (chunk.metadata) {
+                                const metadataItems = [];
+                                for (const [key, value] of Object.entries(chunk.metadata)) {
+                                    metadataItems.push(`<span>${key}: ${value}</span>`);
+                                }
+                                metadataHtml = `<div class="metadata">${metadataItems.join(' | ')}</div>`;
+                            }
+                            
+                            chunkDiv.innerHTML = `
+                                <div class="d-flex justify-content-between align-items-center mb-2">
+                                    <span class="collection-tag">${chunk.collection}</span>
+                                    <small>Score: ${chunk.score.toFixed(4)}</small>
+                                </div>
+                                <div>${chunk.text}</div>
+                                ${metadataHtml}
+                            `;
+                            
+                            chunksContainer.appendChild(chunkDiv);
+                        });
+                        
+                        responseContainer.style.display = 'block';
+                    } else {
+                        alert('Error: ' + data.error);
+                    }
+                } catch (error) {
+                    console.error('Error:', error);
+                    alert('An error occurred while processing your request');
+                } finally {
+                    loading.style.display = 'none';
+                    submitButton.disabled = false;
+                }
+            });
+        });
+    </script>
+    
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>
