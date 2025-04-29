@@ -13,7 +13,7 @@ import json
 app = Flask(__name__)
 
 # Load environment variables
-load_dotenv("/Users/mason/Desktop/Technical_Projects/PYTHON_Projects/PSAI/code/.env")
+load_dotenv(".env")
 
 # Qdrant configuration
 QDRANT_URL = os.getenv("QDRANT_URL")
@@ -191,6 +191,3 @@ if __name__ == '__main__':
         print(f"Error connecting to Qdrant: {e}")
 
     app.run(debug=True)
-
-#To run:
-#/Users/mason/opt/anaconda3/envs/psai/bin/python /Users/mason/Desktop/Technical_Projects/PYTHON_Projects/PSAI/code/app2.py
