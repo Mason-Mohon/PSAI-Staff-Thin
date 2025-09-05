@@ -1,5 +1,10 @@
-from flask import Flask, render_template, request, jsonify, send_file
+from flask import Flask, render_template, request, jsonify, send_file, redirect, session, g
 import os
+import time
+import json
+import uuid
+import urllib.parse
+import requests
 from dotenv import load_dotenv
 from pathlib import Path
 import qdrant_client
@@ -7,7 +12,6 @@ from qdrant_client.models import Distance
 from sentence_transformers import SentenceTransformer
 from google import genai
 from google.genai import types
-import json
 from typing import TypedDict, List, Dict, Any, Literal
 import io
 from datetime import datetime
@@ -16,9 +20,12 @@ from reportlab.lib.pagesizes import letter
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
-import time
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 import logging
+from redis import Redis
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+import boto3
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -28,11 +35,36 @@ logger = logging.getLogger(__name__)
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
 
+# JWT verification
+from auth import verify_token
+
 # Initialize Flask app
 app = Flask(__name__)
 
 # Load environment variables
 load_dotenv("/Users/mason/Desktop/Technical_Projects/PYTHON_Projects/PSAI/code/.env")
+
+# ---------- Configuration ----------
+app.secret_key = os.environ.get("FLASK_SECRET", "change-me")  # session cookies
+
+# Cognito Configuration
+COGNITO_REGION = os.environ.get("COGNITO_REGION", "us-east-2")
+COGNITO_USER_POOL_ID = os.environ.get("COGNITO_USER_POOL_ID", "")
+COGNITO_CLIENT_ID = os.environ.get("COGNITO_CLIENT_ID", "")
+COGNITO_DOMAIN = os.environ.get("COGNITO_DOMAIN", "")
+REDIRECT_URI = os.environ.get("COGNITO_REDIRECT_URI", "https://ai.phyllisschlafly.com/callback")
+
+ISSUER = f"https://cognito-idp.{COGNITO_REGION}.amazonaws.com/{COGNITO_USER_POOL_ID}" if COGNITO_USER_POOL_ID else ""
+DOMAIN = f"https://{COGNITO_DOMAIN}.auth.{COGNITO_REGION}.amazoncognito.com" if COGNITO_DOMAIN else ""
+
+# Feature flags
+FEATURE_CHAT_ENABLED = os.getenv("FEATURE_CHAT_ENABLED", "1") == "1"
+
+# Redis Configuration
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+
+# S3 Logging Configuration (optional)
+LOG_S3_BUCKET = os.getenv("LOG_S3_BUCKET")  # optional
 
 # Qdrant configuration
 QDRANT_URL = os.getenv("QDRANT_URL")
@@ -46,6 +78,101 @@ GEMINI_MODEL = "gemini-2.0-flash-lite"
 qdrant_client_instance = qdrant_client.QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
 embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
 genai_client_instance = genai.Client(api_key=GOOGLE_API_KEY)
+
+# Initialize Redis and Rate Limiting
+redis = Redis.from_url(REDIS_URL, decode_responses=True) if REDIS_URL else None
+
+def user_key():
+    """Get user key for rate limiting"""
+    user = getattr(g, "user", None)
+    if user and "sub" in user:
+        return f"user:{user['sub']}"
+    return f"ip:{get_remote_address()}"
+
+limiter = Limiter(
+    app=app, 
+    key_func=user_key, 
+    storage_uri=REDIS_URL, 
+    strategy="fixed-window", 
+    default_limits=[]
+) if REDIS_URL else None
+
+# Initialize S3 client (optional)
+s3 = boto3.client("s3") if LOG_S3_BUCKET else None
+
+# ---------- Helper Functions ----------
+def incr_daily_counter(sub: str) -> int:
+    """Increment daily usage counter for a user"""
+    if not redis:
+        return 0
+    day = time.strftime("%Y-%m-%d", time.gmtime())
+    k = f"quota:{sub}:{day}"
+    pipe = redis.pipeline()
+    pipe.incr(k)
+    pipe.expire(k, 60 * 60 * 36)  # ~36h TTL
+    cnt, _ = pipe.execute()
+    return int(cnt)
+
+def log_interaction(user, route, req_payload, resp_payload, meta=None):
+    """Log interaction to stdout and optionally S3"""
+    rec = {
+        "id": str(uuid.uuid4()),
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "user_sub": (user or {}).get("sub"),
+        "user_email": (user or {}).get("email"),
+        "route": route,
+        "request": req_payload,
+        "response": resp_payload,
+        "meta": meta or {},
+    }
+    line = json.dumps(rec, ensure_ascii=False)
+    print(line, flush=True)  # CloudWatch via stdout
+    if s3:
+        try:
+            day = rec["ts"][:10]
+            key = f"logs/{day}/{rec['id']}.json"
+            s3.put_object(Bucket=LOG_S3_BUCKET, Key=key, Body=line.encode("utf-8"))
+        except Exception as e:
+            logger.error(f"Failed to log to S3: {e}")
+
+def cognito_authorize_url():
+    """Generate Cognito OAuth2 authorization URL"""
+    if not COGNITO_CLIENT_ID or not DOMAIN:
+        return None
+    params = {
+        "client_id": COGNITO_CLIENT_ID,
+        "response_type": "code",
+        "scope": "openid email profile",
+        "redirect_uri": REDIRECT_URI,
+    }
+    return f"{DOMAIN}/oauth2/authorize?{urllib.parse.urlencode(params)}"
+
+def current_user():
+    """Get current authenticated user from session"""
+    id_token = session.get("id_token")
+    if not id_token or not ISSUER or not COGNITO_CLIENT_ID:
+        return None
+    try:
+        return verify_token(ISSUER, COGNITO_CLIENT_ID, id_token)
+    except Exception:
+        # token could be expired/invalid
+        return None
+
+def is_unlimited(user) -> bool:
+    """Check if user has unlimited access"""
+    if not user:
+        return False
+    groups = set(user.get("cognito:groups", []))
+    plan = user.get("custom:plan")
+    return ("unlimited" in groups) or (plan == "unlimited")
+
+@app.before_request
+def attach_user_and_flags():
+    """Attach user info and apply feature flags before each request"""
+    # Kill-switch example for /chat
+    if request.path.startswith("/chat") and not FEATURE_CHAT_ENABLED:
+        return ("Temporarily disabled", 503)
+    g.user = current_user()
 
 # --- LangGraph State Definition ---
 class GraphState(TypedDict):
@@ -658,6 +785,65 @@ workflow.add_edge("prepare_final_output", END) # Final step
 app_graph = workflow.compile()
 
 
+# --- Authentication Routes ---
+@app.route("/login")
+def login():
+    """Redirect to Cognito login"""
+    auth_url = cognito_authorize_url()
+    if not auth_url:
+        return ("Authentication not configured", 500)
+    return redirect(auth_url)
+
+@app.route("/callback")
+def callback():
+    """Handle OAuth2 callback from Cognito"""
+    code = request.args.get("code")
+    if not code:
+        return ("Missing code", 400)
+    
+    if not DOMAIN or not COGNITO_CLIENT_ID:
+        return ("Authentication not configured", 500)
+        
+    token_url = f"{DOMAIN}/oauth2/token"
+    data = {
+        "grant_type": "authorization_code",
+        "client_id": COGNITO_CLIENT_ID,
+        "redirect_uri": REDIRECT_URI,
+        "code": code,
+    }
+    
+    try:
+        r = requests.post(token_url, data=data, headers={"Content-Type": "application/x-www-form-urlencoded"})
+        if r.status_code != 200:
+            return (f"Token exchange failed: {r.text}", 400)
+        tokens = r.json()
+        session["id_token"] = tokens["id_token"]
+        session["access_token"] = tokens.get("access_token")
+        return redirect("/")
+    except Exception as e:
+        logger.error(f"Error in OAuth callback: {e}")
+        return ("Authentication failed", 500)
+
+@app.route("/logout")
+def logout():
+    """Clear session and redirect to Cognito logout"""
+    session.clear()
+    if DOMAIN and COGNITO_CLIENT_ID:
+        logout_url = f"{DOMAIN}/logout?{urllib.parse.urlencode({'client_id': COGNITO_CLIENT_ID, 'logout_uri': 'https://ai.phyllisschlafly.com/'})}"
+        return redirect(logout_url)
+    return redirect("/")
+
+@app.route("/me")
+def me():
+    """Get current user info"""
+    if not g.user:
+        return redirect("/login")
+    return jsonify({
+        "sub": g.user["sub"], 
+        "email": g.user.get("email"), 
+        "groups": g.user.get("cognito:groups", [])
+    })
+
 # --- Flask Routes ---
 @app.route('/')
 def index():
@@ -669,7 +855,13 @@ def healthz():
     return jsonify({"ok": True})
 
 @app.route('/api/query', methods=['POST'])
+@limiter.limit("100 per day", exempt_when=lambda: is_unlimited(getattr(g, "user", None))) if limiter else lambda f: f
+@limiter.limit("10 per minute", exempt_when=lambda: is_unlimited(getattr(g, "user", None))) if limiter else lambda f: f
 def query_api_route():
+    # Check authentication
+    if not g.user:
+        return jsonify({"error": "Authentication required"}), 401
+    
     data = request.json
     
     initial_graph_input = {
@@ -689,17 +881,47 @@ def query_api_route():
     if not initial_graph_input["selected_collections"]:
         return jsonify({"error": "At least one collection must be selected"}), 400
 
+    # Track usage
+    used_today = incr_daily_counter(g.user["sub"]) if redis else 0
+
+    # Process the query
     final_state = app_graph.invoke(initial_graph_input)
     
     if final_state.get("final_json_response"):
-        return jsonify(final_state["final_json_response"])
+        response_data = final_state["final_json_response"]
+        
+        # Add usage info to response
+        response_data["used_today"] = used_today
+        
+        # Log the interaction
+        log_interaction(
+            user=g.user,
+            route="/api/query",
+            req_payload={"query": initial_graph_input["original_query"], "collections": initial_graph_input["selected_collections"]},
+            resp_payload={"response": response_data.get("response", ""), "chunks_count": len(response_data.get("chunks", []))},
+            meta={"model": GEMINI_MODEL, "used_today": used_today, "iterations": response_data.get("iterations_done", 0)}
+        )
+        
+        return jsonify(response_data)
     else:
         error_msg = final_state.get("error_message", "An unexpected error occurred in the graph processing.")
-        return jsonify({
+        error_response = {
             "error": error_msg,
             "original_query": initial_graph_input["original_query"],
-            "response": error_msg
-        }), 500
+            "response": error_msg,
+            "used_today": used_today
+        }
+        
+        # Log the error
+        log_interaction(
+            user=g.user,
+            route="/api/query",
+            req_payload={"query": initial_graph_input["original_query"], "collections": initial_graph_input["selected_collections"]},
+            resp_payload={"error": error_msg},
+            meta={"model": GEMINI_MODEL, "used_today": used_today, "error": True}
+        )
+        
+        return jsonify(error_response), 500
 
 def format_conversation_text(query: str, response: str, chunks: List[Dict]) -> str:
     """Format the conversation as plain text."""
@@ -799,6 +1021,10 @@ def create_pdf(query: str, response: str, chunks: List[Dict]) -> bytes:
 
 @app.route('/api/download/<format>', methods=['POST'])
 def download_conversation(format):
+    # Check authentication
+    if not g.user:
+        return jsonify({"error": "Authentication required"}), 401
+        
     data = request.json
     query = data.get('query', '')
     response = data.get('response', '')
@@ -819,6 +1045,15 @@ def download_conversation(format):
         filename = f"conversation_{timestamp}.pdf"
         mimetype = 'application/pdf'
     
+    # Log the download
+    log_interaction(
+        user=g.user,
+        route=f"/api/download/{format}",
+        req_payload={"format": format, "query_length": len(query), "chunks_count": len(chunks)},
+        resp_payload={"filename": filename, "format": format},
+        meta={"download": True}
+    )
+    
     buffer.seek(0)
     return send_file(
         buffer,
@@ -826,6 +1061,33 @@ def download_conversation(format):
         as_attachment=True,
         download_name=filename
     )
+
+# Example chat endpoint (mentioned in original integration code)
+@app.route("/chat")
+@limiter.limit("100 per day", exempt_when=lambda: is_unlimited(getattr(g, "user", None))) if limiter else lambda f: f
+@limiter.limit("10 per minute", exempt_when=lambda: is_unlimited(getattr(g, "user", None))) if limiter else lambda f: f
+def chat():
+    """Simple chat endpoint that echoes the prompt (can be extended)"""
+    if not g.user:
+        return jsonify({"error": "Authentication required"}), 401
+    
+    prompt = request.args.get("q", "")
+    if not prompt:
+        return jsonify({"error": "Query parameter 'q' is required"}), 400
+
+    # Simple echo response (this can be extended to use your RAG system)
+    answer = {"text": f"Echo: {prompt}"}
+    used_today = incr_daily_counter(g.user["sub"]) if redis else 0
+
+    log_interaction(
+        user=g.user,
+        route="/chat",
+        req_payload={"prompt": prompt},
+        resp_payload=answer,
+        meta={"model": "echo", "used_today": used_today}
+    )
+    
+    return jsonify({"answer": answer, "used_today": used_today})
 
 if __name__ == '__main__':
     if not GOOGLE_API_KEY:
