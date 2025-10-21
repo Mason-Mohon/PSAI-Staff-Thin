@@ -59,6 +59,7 @@ DOMAIN = f"https://{COGNITO_DOMAIN}.auth.{COGNITO_REGION}.amazoncognito.com" if 
 
 # Feature flags
 FEATURE_CHAT_ENABLED = os.getenv("FEATURE_CHAT_ENABLED", "1") == "1"
+REQUIRE_AUTH = os.getenv("REQUIRE_AUTH", "0") == "1"  # Set to 0 for local dev
 
 # Redis Configuration
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
@@ -187,6 +188,8 @@ class GraphState(TypedDict):
     similarity_threshold: float
     temperature: float
     
+    chat_history: List[Dict[str, str]] | None
+    
     search_results: List[Dict[str, Any]] | None
     formatted_context_for_generation: str | None
     
@@ -311,7 +314,7 @@ def semantic_search_internal(query_text, collections, limit=5, similarity_thresh
     all_results.sort(key=lambda x: x["score"], reverse=True)
     return all_results[:limit]
 
-def generate_gemini_response_internal(query, context_chunks, temperature=0.7):
+def generate_gemini_response_internal(query, context_chunks, temperature=0.7, chat_history=None):
     try:
         formatted_chunks_for_prompt = []
         for idx, chunk in enumerate(context_chunks):
@@ -331,6 +334,15 @@ def generate_gemini_response_internal(query, context_chunks, temperature=0.7):
             formatted_chunks_for_prompt.append(f"Source [{source_info}]: {chunk['text']}")
         
         formatted_context_string = "\\n\\n".join(formatted_chunks_for_prompt)
+        
+        # Format chat history if provided
+        chat_history_string = ""
+        if chat_history and len(chat_history) > 0:
+            chat_history_parts = ["Previous conversation:"]
+            for i, exchange in enumerate(chat_history, 1):
+                chat_history_parts.append(f"Q{i}: {exchange.get('query', '')}")
+                chat_history_parts.append(f"A{i}: {exchange.get('response', '')}")
+            chat_history_string = "\\n".join(chat_history_parts) + "\\n\\n"
 
         system_instruction = (
             "You are Phyllis Schlafly answering questions based solely on the provided context or the included biographical information."
@@ -380,6 +392,7 @@ def generate_gemini_response_internal(query, context_chunks, temperature=0.7):
 	        "Your early life, marriage, and motherhood influenced who you became as a grassroots political figure. Your upbringing created an intelligent, hardworking woman who saw no boundaries for herself in the professional world. Your marriage was not only a lifelong partnership of love, but also strengthened your political backbone and knowledge. Marriage also rewarded you with six children, the title of mother, which you prized above all. Without your children, you would not have had such a push to improve education, as well as defeat the ERA."
         )
         prompt = (
+            f"{chat_history_string}"
             f"Context:\\n{formatted_context_string}\\n\\n"
             f"Question: {query}\\n\\n"
             "Answer the question strictly based on the above context or biographical information. Do not include [REF_*] markers or an Endnotes section in the answer."
@@ -536,7 +549,8 @@ def generate_response_node(state: GraphState) -> Dict[str, Any]:
     response_data = generate_gemini_response_internal(
         query=state['original_query'],
         context_chunks=state['search_results'],
-        temperature=state['temperature']
+        temperature=state['temperature'],
+        chat_history=state.get('chat_history')
     )
     return {
         "generated_response_text": response_data["text"],
@@ -856,8 +870,8 @@ def healthz():
 @limiter.limit("100 per day", exempt_when=lambda: is_unlimited(getattr(g, "user", None))) if limiter else lambda f: f
 @limiter.limit("10 per minute", exempt_when=lambda: is_unlimited(getattr(g, "user", None))) if limiter else lambda f: f
 def query_api_route():
-    # Check authentication
-    if not g.user:
+    # Check authentication (only if required)
+    if REQUIRE_AUTH and not g.user:
         return jsonify({"error": "Authentication required"}), 401
     
     data = request.json
@@ -872,6 +886,7 @@ def query_api_route():
         "max_chunk_limit": 15,
         "iteration_count": 1,
         "max_iterations": 3,
+        "chat_history": data.get('chat_history', []),
     }
     
     if not initial_graph_input["original_query"]:
@@ -880,7 +895,7 @@ def query_api_route():
         return jsonify({"error": "At least one collection must be selected"}), 400
 
     # Track usage
-    used_today = incr_daily_counter(g.user["sub"]) if redis else 0
+    used_today = incr_daily_counter(g.user["sub"]) if (redis and g.user) else 0
 
     # Process the query
     final_state = app_graph.invoke(initial_graph_input)
@@ -921,30 +936,42 @@ def query_api_route():
         
         return jsonify(error_response), 500
 
-def format_conversation_text(query: str, response: str, chunks: List[Dict]) -> str:
+def format_conversation_text(messages: List[Dict], include_references: bool = True) -> str:
     """Format the conversation as plain text."""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     text = f"Conversation Export - {timestamp}\n\n"
-    text += "Question:\n" + query + "\n\n"
-    text += "Answer:\n" + response + "\n\n"
-    text += "Reference Chunks:\n"
     
-    for i, chunk in enumerate(chunks, 1):
-        text += f"\nChunk {i}:\n"
-        text += f"Collection: {chunk.get('collection', 'N/A')}\n"
-        text += f"Text: {chunk.get('text', 'N/A')}\n"
-        text += f"Score: {chunk.get('score', 'N/A')}\n"
+    for i, msg in enumerate(messages, 1):
+        query = msg.get('query', '')
+        response = msg.get('response', '')
+        chunks = msg.get('chunks', [])
         
-        metadata = chunk.get('metadata', {})
-        if metadata:
-            text += "Metadata:\n"
-            for key, value in metadata.items():
-                text += f"  {key}: {value}\n"
-        text += "-" * 80 + "\n"
+        text += f"{'=' * 80}\n"
+        text += f"Message {i}\n"
+        text += f"{'=' * 80}\n\n"
+        text += "Question:\n" + query + "\n\n"
+        text += "Answer:\n" + response + "\n\n"
+        
+        if include_references and chunks:
+            text += "Reference Chunks:\n"
+            for j, chunk in enumerate(chunks, 1):
+                text += f"\nChunk {j}:\n"
+                text += f"Collection: {chunk.get('collection', 'N/A')}\n"
+                text += f"Text: {chunk.get('text', 'N/A')}\n"
+                text += f"Score: {chunk.get('score', 'N/A')}\n"
+                
+                metadata = chunk.get('metadata', {})
+                if metadata:
+                    text += "Metadata:\n"
+                    for key, value in metadata.items():
+                        text += f"  {key}: {value}\n"
+                text += "-" * 80 + "\n"
+        
+        text += "\n"
     
     return text
 
-def create_pdf(query: str, response: str, chunks: List[Dict]) -> bytes:
+def create_pdf(messages: List[Dict], include_references: bool = True) -> bytes:
     """Create a PDF document of the conversation."""
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=letter, rightMargin=72, leftMargin=72, topMargin=72, bottomMargin=72)
@@ -963,6 +990,12 @@ def create_pdf(query: str, response: str, chunks: List[Dict]) -> bytes:
         fontSize=14,
         spaceAfter=12
     )
+    subheading_style = ParagraphStyle(
+        'CustomSubheading',
+        parent=styles['Heading3'],
+        fontSize=12,
+        spaceAfter=8
+    )
     normal_style = styles['Normal']
     
     # Content
@@ -973,45 +1006,80 @@ def create_pdf(query: str, response: str, chunks: List[Dict]) -> bytes:
     elements.append(Paragraph(f"Conversation Export - {timestamp}", title_style))
     elements.append(Spacer(1, 12))
     
-    # Question
-    elements.append(Paragraph("Question:", heading_style))
-    elements.append(Paragraph(query, normal_style))
-    elements.append(Spacer(1, 12))
-    
-    # Answer
-    elements.append(Paragraph("Answer:", heading_style))
-    elements.append(Paragraph(response, normal_style))
-    elements.append(Spacer(1, 12))
-    
-    # Reference Chunks
-    elements.append(Paragraph("Reference Chunks:", heading_style))
-    
-    for i, chunk in enumerate(chunks, 1):
+    for i, msg in enumerate(messages, 1):
+        query = msg.get('query', '')
+        response = msg.get('response', '')
+        chunks = msg.get('chunks', [])
+        
+        # Message separator
+        if i > 1:
+            elements.append(Spacer(1, 20))
+        
+        elements.append(Paragraph(f"Message {i}", heading_style))
+        elements.append(Spacer(1, 8))
+        
+        # Question
+        elements.append(Paragraph("Question:", subheading_style))
+        elements.append(Paragraph(query, normal_style))
         elements.append(Spacer(1, 12))
-        elements.append(Paragraph(f"Chunk {i}:", heading_style))
         
-        # Create a table for chunk details
-        data = [
-            ["Collection:", chunk.get('collection', 'N/A')],
-            ["Score:", str(chunk.get('score', 'N/A'))],
-            ["Text:", chunk.get('text', 'N/A')]
-        ]
+        # Answer
+        elements.append(Paragraph("Answer:", subheading_style))
+        elements.append(Paragraph(response, normal_style))
+        elements.append(Spacer(1, 12))
         
-        metadata = chunk.get('metadata', {})
-        for key, value in metadata.items():
-            data.append([f"{key}:", str(value)])
+        # Reference Chunks
+        if include_references and chunks:
+            elements.append(Paragraph("Reference Chunks:", subheading_style))
             
-        table = Table(data, colWidths=[1.5*inch, 5*inch])
-        table.setStyle(TableStyle([
-            ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
-            ('FONTSIZE', (0, 0), (-1, -1), 10),
-            ('TOPPADDING', (0, 0), (-1, -1), 6),
-            ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
-            ('TEXTCOLOR', (0, 0), (0, -1), colors.grey),
-            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
-            ('GRID', (0, 0), (-1, -1), 0.25, colors.grey),
-        ]))
-        elements.append(table)
+            for j, chunk in enumerate(chunks, 1):
+                elements.append(Spacer(1, 8))
+                elements.append(Paragraph(f"<b>Chunk {j}</b>", normal_style))
+                elements.append(Spacer(1, 4))
+                
+                # Create a table for metadata only (not the text)
+                metadata_data = [
+                    ["Collection:", chunk.get('collection', 'N/A')],
+                    ["Score:", str(chunk.get('score', 'N/A'))]
+                ]
+                
+                metadata = chunk.get('metadata', {})
+                for key, value in metadata.items():
+                    metadata_data.append([f"{key}:", str(value)])
+                    
+                table = Table(metadata_data, colWidths=[1.5*inch, 5*inch])
+                table.setStyle(TableStyle([
+                    ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
+                    ('FONTSIZE', (0, 0), (-1, -1), 9),
+                    ('TOPPADDING', (0, 0), (-1, -1), 4),
+                    ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+                    ('TEXTCOLOR', (0, 0), (0, -1), colors.grey),
+                    ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                    ('GRID', (0, 0), (-1, -1), 0.25, colors.grey),
+                ]))
+                elements.append(table)
+                elements.append(Spacer(1, 4))
+                
+                # Add text as a Paragraph so it can flow across pages
+                chunk_text = chunk.get('text', 'N/A')
+                # Escape HTML special characters and preserve formatting
+                from xml.sax.saxutils import escape
+                chunk_text_escaped = escape(chunk_text)
+                text_style = ParagraphStyle(
+                    'ChunkText',
+                    parent=normal_style,
+                    fontSize=9,
+                    leading=11,
+                    leftIndent=10,
+                    rightIndent=10,
+                    spaceBefore=4,
+                    spaceAfter=4,
+                    borderPadding=5,
+                    borderWidth=1,
+                    borderColor=colors.lightgrey
+                )
+                elements.append(Paragraph(f"<b>Text:</b> {chunk_text_escaped}", text_style))
+                elements.append(Spacer(1, 6))
     
     doc.build(elements)
     buffer.seek(0)
@@ -1019,27 +1087,29 @@ def create_pdf(query: str, response: str, chunks: List[Dict]) -> bytes:
 
 @app.route('/api/download/<format>', methods=['POST'])
 def download_conversation(format):
-    # Check authentication
-    if not g.user:
+    # Check authentication (only if required)
+    if REQUIRE_AUTH and not g.user:
         return jsonify({"error": "Authentication required"}), 401
         
     data = request.json
-    query = data.get('query', '')
-    response = data.get('response', '')
-    chunks = data.get('chunks', [])
+    messages = data.get('messages', [])
+    include_references = data.get('include_references', True)
     
     if format not in ['txt', 'pdf']:
         return jsonify({"error": "Invalid format. Must be 'txt' or 'pdf'"}), 400
     
+    if not messages:
+        return jsonify({"error": "No messages provided"}), 400
+    
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     
     if format == 'txt':
-        text_content = format_conversation_text(query, response, chunks)
+        text_content = format_conversation_text(messages, include_references)
         buffer = io.BytesIO(text_content.encode('utf-8'))
         filename = f"conversation_{timestamp}.txt"
         mimetype = 'text/plain'
     else:  # pdf
-        buffer = io.BytesIO(create_pdf(query, response, chunks))
+        buffer = io.BytesIO(create_pdf(messages, include_references))
         filename = f"conversation_{timestamp}.pdf"
         mimetype = 'application/pdf'
     
@@ -1047,7 +1117,7 @@ def download_conversation(format):
     log_interaction(
         user=g.user,
         route=f"/api/download/{format}",
-        req_payload={"format": format, "query_length": len(query), "chunks_count": len(chunks)},
+        req_payload={"format": format, "messages_count": len(messages), "include_references": include_references},
         resp_payload={"filename": filename, "format": format},
         meta={"download": True}
     )
@@ -1066,7 +1136,7 @@ def download_conversation(format):
 @limiter.limit("10 per minute", exempt_when=lambda: is_unlimited(getattr(g, "user", None))) if limiter else lambda f: f
 def chat():
     """Simple chat endpoint that echoes the prompt (can be extended)"""
-    if not g.user:
+    if REQUIRE_AUTH and not g.user:
         return jsonify({"error": "Authentication required"}), 401
     
     prompt = request.args.get("q", "")
@@ -1075,7 +1145,7 @@ def chat():
 
     # Simple echo response (this can be extended to use your RAG system)
     answer = {"text": f"Echo: {prompt}"}
-    used_today = incr_daily_counter(g.user["sub"]) if redis else 0
+    used_today = incr_daily_counter(g.user["sub"]) if (redis and g.user) else 0
 
     log_interaction(
         user=g.user,
