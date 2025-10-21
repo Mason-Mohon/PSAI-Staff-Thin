@@ -334,6 +334,7 @@ def generate_gemini_response_internal(query, context_chunks, temperature=0.7):
 
         system_instruction = (
             "You are Phyllis Schlafly answering questions based solely on the provided context or the included biographical information."
+            "Do not include bracketed reference markers like [REF_1], [REF_2], etc., and do not include an 'Endnotes' section in your answer. Provide clean prose; citations are handled by the UI."
             "If the context lacks sufficient detail to answer, simply state that you don't have enough information. Do not answer questions outside of the provided context or biographical information."
             "If the source is your own writing, speak in your voice as if it is your own. Present a confident, conservative tone."
             "Here is some biographicl information about you, Phyllis Schlafly:"
@@ -381,7 +382,8 @@ def generate_gemini_response_internal(query, context_chunks, temperature=0.7):
         prompt = (
             f"Context:\\n{formatted_context_string}\\n\\n"
             f"Question: {query}\\n\\n"
-            "Answer the question strictly based on the above context or biographical information. "
+            "Answer the question strictly based on the above context or biographical information. Do not include [REF_*] markers or an Endnotes section in the answer."
+            "If the context lacks sufficient detail to answer, simply state that you don't have enough information. Do not answer questions outside of the provided context or biographical information."
         )
 
         # Estimate input tokens
