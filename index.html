@@ -44,6 +44,29 @@
             justify-content: space-between;
             align-items: center;
             border-bottom: 1px solid var(--border-color);
+            gap: 1rem;
+        }
+        
+        .header-actions {
+            display: flex;
+            gap: 0.5rem;
+        }
+        
+        .download-all-btn {
+            background: var(--primary-red);
+            border: 1px solid var(--primary-red);
+            color: white;
+            padding: 0.5rem 1rem;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            font-size: 0.9rem;
+            display: none;
+        }
+        
+        .download-all-btn:hover {
+            background: rgba(155, 18, 23, 1);
+            box-shadow: 0 2px 8px rgba(155, 18, 23, 0.3);
         }
 
         .header-logo {
@@ -178,7 +201,7 @@
             display: none;
             position: absolute;
             background: white;
-            min-width: 160px;
+            min-width: 220px;
             box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
             border-radius: 6px;
             padding: 0.5rem;
@@ -205,6 +228,50 @@
         }
 
         .download-option:hover {
+            background: var(--light-blue);
+        }
+        
+        .download-options-header {
+            padding: 0.5rem 1rem;
+            border-bottom: 1px solid var(--border-color);
+            margin-bottom: 0.5rem;
+        }
+        
+        .download-options-header label {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            cursor: pointer;
+            font-size: 0.9rem;
+            color: var(--primary-blue);
+            margin: 0;
+        }
+        
+        .download-all-options {
+            display: none;
+            position: fixed;
+            background: white;
+            min-width: 220px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+            border-radius: 6px;
+            padding: 0.5rem;
+            z-index: 1001;
+            border: 1px solid var(--border-color);
+        }
+        
+        .download-all-options .download-option {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.5rem 1rem;
+            color: var(--primary-blue);
+            text-decoration: none;
+            cursor: pointer;
+            border-radius: 4px;
+            transition: all 0.2s ease;
+        }
+        
+        .download-all-options .download-option:hover {
             background: var(--light-blue);
         }
 
@@ -405,9 +472,14 @@
                 <img src="{{ url_for('static', filename='images/PSElogoCS_v2_transparent600.png') }}" alt="PSAI Logo">
                 <h1>Phyllis AI</h1>
             </div>
-            <button class="settings-btn" onclick="toggleSettings()">
-                <i class="bi bi-gear"></i> Settings
-            </button>
+            <div class="header-actions">
+                <button class="download-all-btn" id="downloadAllBtn" onclick="toggleDownloadAllOptions()">
+                    <i class="bi bi-download"></i> Download Conversation
+                </button>
+                <button class="settings-btn" onclick="toggleSettings()">
+                    <i class="bi bi-gear"></i> Settings
+                </button>
+            </div>
         </div>
 
         <!-- Chat Messages Area -->
@@ -491,10 +563,27 @@
 
     <!-- Overlay -->
     <div class="overlay" id="overlay" onclick="toggleSettings()"></div>
+    
+    <!-- Download All Options Dropdown -->
+    <div class="download-all-options" id="downloadAllOptions">
+        <div class="download-options-header">
+            <label>
+                <input type="checkbox" id="includeReferencesAll" checked>
+                Include References
+            </label>
+        </div>
+        <a class="download-option" onclick="downloadFullConversation('txt')">
+            <i class="bi bi-file-text"></i> Download as TXT
+        </a>
+        <a class="download-option" onclick="downloadFullConversation('pdf')">
+            <i class="bi bi-file-pdf"></i> Download as PDF
+        </a>
+    </div>
 
     <script>
         let messageCounter = 0;
-        let currentConversationData = {};
+        let chatHistory = []; // Max 4 Q&A pairs for context
+        let conversationMessages = {}; // All messages stored by ID
 
         function toggleSettings() {
             const panel = document.getElementById('settingsPanel');
@@ -558,12 +647,26 @@
             messageCounter++;
             const chatMessages = document.getElementById('chatMessages');
             
-            // Store the conversation data for downloads
-            currentConversationData = {
+            // Store message data
+            conversationMessages[messageCounter] = {
                 query: userQuery,
                 response: aiResponse,
                 chunks: chunks
             };
+            
+            // Add to chat history (max 4 Q&A pairs)
+            chatHistory.push({
+                query: userQuery,
+                response: aiResponse
+            });
+            
+            // Remove oldest if we exceed 4 pairs
+            if (chatHistory.length > 4) {
+                chatHistory.shift();
+            }
+            
+            // Show download all button
+            document.getElementById('downloadAllBtn').style.display = 'block';
             
             // Remove empty state if it exists
             const emptyState = chatMessages.querySelector('.empty-state');
@@ -599,10 +702,16 @@
                                 <i class="bi bi-download"></i> Download
                             </button>
                             <div class="download-options" id="download-options-${messageCounter}">
-                                <a class="download-option" onclick="downloadConversation('txt')">
+                                <div class="download-options-header">
+                                    <label>
+                                        <input type="checkbox" id="includeReferences-${messageCounter}" checked>
+                                        Include References
+                                    </label>
+                                </div>
+                                <a class="download-option" onclick="downloadConversation(${messageCounter}, 'txt')">
                                     <i class="bi bi-file-text"></i> Download as TXT
                                 </a>
-                                <a class="download-option" onclick="downloadConversation('pdf')">
+                                <a class="download-option" onclick="downloadConversation(${messageCounter}, 'pdf')">
                                     <i class="bi bi-file-pdf"></i> Download as PDF
                                 </a>
                             </div>
@@ -666,14 +775,48 @@
             });
         }
 
-        async function downloadConversation(format) {
+        function toggleDownloadAllOptions() {
+            const options = document.getElementById('downloadAllOptions');
+            const btn = document.getElementById('downloadAllBtn');
+            const rect = btn.getBoundingClientRect();
+            
+            if (options.style.display === 'block') {
+                options.style.display = 'none';
+            } else {
+                options.style.display = 'block';
+                options.style.top = `${rect.bottom + 5}px`;
+                options.style.left = `${rect.left}px`;
+                
+                // Close when clicking outside
+                setTimeout(() => {
+                    document.addEventListener('click', function closeDropdown(e) {
+                        if (!e.target.closest('#downloadAllBtn') && !e.target.closest('#downloadAllOptions')) {
+                            options.style.display = 'none';
+                            document.removeEventListener('click', closeDropdown);
+                        }
+                    });
+                }, 100);
+            }
+        }
+        
+        async function downloadConversation(messageId, format) {
             try {
+                const includeReferences = document.getElementById(`includeReferences-${messageId}`).checked;
+                const messageData = conversationMessages[messageId];
+                
+                if (!messageData) {
+                    throw new Error('Message not found');
+                }
+                
                 const response = await fetch(`/api/download/${format}`, {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json'
                     },
-                    body: JSON.stringify(currentConversationData)
+                    body: JSON.stringify({
+                        messages: [messageData],
+                        include_references: includeReferences
+                    })
                 });
 
                 if (!response.ok) {
@@ -687,7 +830,7 @@
                 // Create a temporary link and click it
                 const a = document.createElement('a');
                 a.href = url;
-                a.download = response.headers.get('content-disposition')?.split('filename=')[1] || `conversation.${format}`;
+                a.download = response.headers.get('content-disposition')?.split('filename=')[1] || `message_${messageId}.${format}`;
                 document.body.appendChild(a);
                 a.click();
                 
@@ -704,6 +847,61 @@
                 alert('Failed to download the conversation. Please try again.');
             }
         }
+        
+        async function downloadFullConversation(format) {
+            try {
+                const includeReferences = document.getElementById('includeReferencesAll').checked;
+                
+                // Get all messages in order
+                const allMessages = [];
+                for (let i = 1; i <= messageCounter; i++) {
+                    if (conversationMessages[i]) {
+                        allMessages.push(conversationMessages[i]);
+                    }
+                }
+                
+                if (allMessages.length === 0) {
+                    alert('No messages to download');
+                    return;
+                }
+                
+                const response = await fetch(`/api/download/${format}`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        messages: allMessages,
+                        include_references: includeReferences
+                    })
+                });
+
+                if (!response.ok) {
+                    throw new Error('Download failed');
+                }
+
+                // Create a blob from the response
+                const blob = await response.blob();
+                const url = window.URL.createObjectURL(blob);
+                
+                // Create a temporary link and click it
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = response.headers.get('content-disposition')?.split('filename=')[1] || `full_conversation.${format}`;
+                document.body.appendChild(a);
+                a.click();
+                
+                // Cleanup
+                window.URL.revokeObjectURL(url);
+                document.body.removeChild(a);
+                
+                // Close dropdown
+                document.getElementById('downloadAllOptions').style.display = 'none';
+            } catch (error) {
+                console.error('Error downloading full conversation:', error);
+                alert('Failed to download the full conversation. Please try again.');
+            }
+        }
 
         async function sendMessage() {
             if (!validateInput()) return;
@@ -714,13 +912,14 @@
             
             const userQuery = chatInput.value.trim();
             
-            // Prepare request data
+            // Prepare request data with chat history
             const requestData = {
                 query: userQuery,
                 collections: getSelectedCollections(),
                 chunk_limit: parseInt(document.getElementById('chunkLimit').value),
                 temperature: parseFloat(document.getElementById('temperature').value),
-                similarity_threshold: parseFloat(document.getElementById('similarityThreshold').value)
+                similarity_threshold: parseFloat(document.getElementById('similarityThreshold').value),
+                chat_history: chatHistory // Include last 4 Q&A pairs for context
             };
 
             // Show loading state
