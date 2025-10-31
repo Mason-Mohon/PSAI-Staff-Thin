@@ -465,17 +465,6 @@ def generate_fallback_response(query: str, chunks: List[Dict]) -> str:
             if text:
                 response_parts.append(f"\n{text}")
         
-        # Add endnotes
-        response_parts.append("\nSources:")
-        for i, chunk in enumerate(sorted_chunks, 1):
-            metadata = chunk.get('metadata', {})
-            source = metadata.get('book_title') or metadata.get('doc_type') or chunk.get('collection', 'Unknown source')
-            year = metadata.get('publication_year', '')
-            citation = f"[{i}] {source}"
-            if year:
-                citation += f", {year}"
-            response_parts.append(citation)
-        
         return "\n".join(response_parts)
         
     except Exception as e:
