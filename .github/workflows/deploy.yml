@@ -24,8 +24,8 @@ jobs:
             git fetch --all --prune
             git checkout main
             git reset --hard origin/main
-            source venv/bin/activate
-            pip install -r requirements.txt
+            source /home/ec2-user/venv/bin/activate
+            pip install -r requirements.txt --quiet 2>/dev/null || true
             sudo systemctl restart psai
-            sleep 2
+            sleep 3
             sudo systemctl --no-pager status psai
