@@ -38,9 +38,12 @@ app.secret_key = os.environ.get("FLASK_SECRET", "change-me")
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 
-# Google Gemini
+# Google Gemini — two models
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash-001")
+GEMINI_MAIN_MODEL = os.getenv("GEMINI_MAIN_MODEL", "gemini-3.0-flash")
+GEMINI_EVAL_MODEL = os.getenv("GEMINI_EVAL_MODEL", "gemini-2.5-flash-lite")
+MAX_CRITIQUE_ITERATIONS = 3
+MAX_CHUNK_LIMIT = 15
 
 # Cognito
 COGNITO_REGION = os.environ.get("COGNITO_REGION", "us-east-2")
@@ -155,57 +158,176 @@ def semantic_search(query_text: str, collections: List[str], limit: int = 5, sim
     all_results.sort(key=lambda x: x["score"], reverse=True)
     return all_results[:limit]
 
-# ---------- Gemini generation ----------
-def generate_response(query: str, context_chunks: List[Dict], temperature: float = 0.7, chat_history: List[Dict] = None) -> Dict[str, Any]:
-    formatted_chunks = []
-    for chunk in context_chunks:
+# ---------- Gemini helpers ----------
+def _call_gemini(model: str, prompt: str, config) -> Any:
+    """Call Gemini with basic error handling."""
+    response = genai_client.models.generate_content(model=model, contents=prompt, config=config)
+    if not response or not response.text:
+        raise RuntimeError("Empty response from Gemini API")
+    return response
+
+def _format_context(chunks: List[Dict]) -> str:
+    """Format chunks into a context string for prompts."""
+    parts = []
+    for chunk in chunks:
         meta = chunk.get("metadata", {})
-        parts = [f"Collection: {chunk['collection']}"]
+        info = [f"Collection: {chunk['collection']}"]
         for field in ("book_title", "publication_year", "author", "doc_type", "source_file"):
             val = meta.get(field)
             if val:
-                parts.append(f"{field.replace('_', ' ').title()}: {val}")
-        formatted_chunks.append(f"Source [{', '.join(parts)}]: {chunk['text']}")
+                info.append(f"{field.replace('_', ' ').title()}: {val}")
+        parts.append(f"Source [{', '.join(info)}]: {chunk['text']}")
+    return "\n\n".join(parts)
 
-    context = "\n\n".join(formatted_chunks)
+# ---------- Eval model: query refinement (gemini-2.5-flash-lite) ----------
+def refine_query(query_text: str) -> str:
+    """Use the eval model to rewrite the query for better semantic search."""
+    prompt = f"""Rewrite the following user query to be optimized for semantic search against a knowledge base primarily focused on Phyllis Schlafly's life, work, and conservative viewpoints.
+Extract the key entities, topics, and the core intent. Remove conversational filler, stop words, or redundant phrases that do not contribute to semantic meaning for retrieval.
+The output should be a concise query string, ideally a few keywords or a very short phrase.
 
-    system_instruction = (
-        "You are playing the role of Phyllis Schlafly that answers questions based on the provided context. "
-        "If the context doesn't contain relevant information to answer the question, "
-        "say that you don't have enough information. "
-        "Cite your sources with endnotes at the end of each response, referencing the source metadata provided. "
-        "Always maintain Phyllis Schlafly's conservative perspective and voice."
-    )
+User Query: "{query_text}"
+Optimized Search Query:"""
 
-    # Build conversation history
+    try:
+        config = types.GenerateContentConfig(temperature=0.1, max_output_tokens=60, stop_sequences=["\n"])
+        response = _call_gemini(GEMINI_EVAL_MODEL, prompt, config)
+        refined = response.text.strip()
+        if refined.startswith("Optimized Search Query:"):
+            refined = refined.replace("Optimized Search Query:", "").strip()
+        refined = refined.strip("'\"")
+        logger.info("Query refined: '%s' -> '%s'", query_text, refined)
+        return refined if refined else query_text
+    except Exception as e:
+        logger.warning("Query refinement failed, using original: %s", e)
+        return query_text
+
+# ---------- Main model: response generation (gemini-3.0-flash) ----------
+SYSTEM_INSTRUCTION = (
+    "You are Phyllis Schlafly answering questions based solely on the provided context or the included biographical information. "
+    "Do not include bracketed reference markers like [REF_1], [REF_2], etc., and do not include an 'Endnotes' section in your answer. Provide clean prose; citations are handled by the UI. "
+    "If the context lacks sufficient detail to answer, simply state that you don't have enough information. Do not answer questions outside of the provided context or biographical information. "
+    "If the source is your own writing, speak in your voice as if it is your own. Present a confident, conservative tone."
+)
+
+def generate_response(query: str, context_chunks: List[Dict], temperature: float = 0.7, chat_history: List[Dict] = None) -> Dict[str, Any]:
+    """Generate a response using the main model (gemini-3.0-flash)."""
+    context = _format_context(context_chunks)
+
     history_text = ""
     if chat_history:
         for pair in chat_history[-4:]:
             history_text += f"User: {pair.get('query', '')}\nAssistant: {pair.get('response', '')}\n\n"
 
-    prompt = f"{history_text}Context:\n{context}\n\nQuestion: {query}"
+    prompt = (
+        f"{history_text}"
+        f"Context:\n{context}\n\n"
+        f"Question: {query}\n\n"
+        "Answer the question strictly based on the above context or biographical information. "
+        "If the context lacks sufficient detail to answer, simply state that you don't have enough information."
+    )
 
     try:
-        response = genai_client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                system_instruction=system_instruction,
-                temperature=temperature,
-                max_output_tokens=2048,
-            ),
+        config = types.GenerateContentConfig(
+            system_instruction=SYSTEM_INSTRUCTION,
+            temperature=temperature,
+            max_output_tokens=1024,
         )
-        text = response.text or "I couldn't generate a response."
+        response = _call_gemini(GEMINI_MAIN_MODEL, prompt, config)
         usage = getattr(response, "usage_metadata", None)
         token_info = {
             "input_tokens": getattr(usage, "prompt_token_count", 0) if usage else 0,
             "output_tokens": getattr(usage, "candidates_token_count", 0) if usage else 0,
             "total_tokens": getattr(usage, "total_token_count", 0) if usage else 0,
         }
-        return {"response": text, "token_info": token_info}
+        return {"response": response.text, "token_info": token_info}
     except Exception as e:
-        logger.error("Gemini error: %s", e)
+        logger.error("Generation error: %s", e)
         return {"response": f"Error generating response: {e}", "token_info": {}}
+
+# ---------- Eval model: critique (gemini-2.5-flash-lite) ----------
+def critique_response(query: str, context: str, answer: str, chunk_limit: int, iteration: int) -> Dict[str, str]:
+    """Use the eval model to assess the generated answer quality."""
+    critique_prompt = f"""You are an expert evaluator. Your task is to assess a generated answer based on a user's query and the context retrieved to formulate that answer.
+The system can retrieve up to {MAX_CHUNK_LIMIT} context chunks in total. It is currently on iteration {iteration} of {MAX_CRITIQUE_ITERATIONS} and has retrieved {chunk_limit} chunks.
+
+User Query:
+{query}
+
+Retrieved Context Used for Answer:
+{context}
+
+Generated Answer:
+{answer}
+
+Based on this, provide your evaluation in JSON format with the following keys:
+- "answer_quality": A string, must be one of ["GOOD", "ACCEPTABLE_NEEDS_MORE_CONTEXT", "POOR_NEEDS_MORE_CONTEXT", "ACCEPTABLE_NO_MORE_CONTEXT_NEEDED", "POOR_NO_MORE_CONTEXT_NEEDED"].
+  - "GOOD": The answer is comprehensive and well-supported. No further action needed.
+  - "ACCEPTABLE_NEEDS_MORE_CONTEXT": The answer is okay but could be substantially improved with more supporting details from the knowledge base.
+  - "POOR_NEEDS_MORE_CONTEXT": The answer is weak/incomplete, and more context is likely required.
+  - "ACCEPTABLE_NO_MORE_CONTEXT_NEEDED": The answer is okay. More context is unlikely to help or we've hit limits.
+  - "POOR_NO_MORE_CONTEXT_NEEDED": The answer is weak. More context is unlikely to help or we've hit limits.
+- "reasoning": A brief explanation for your assessment.
+
+JSON Output:
+"""
+    try:
+        config = types.GenerateContentConfig(temperature=0.2, max_output_tokens=200)
+        response = _call_gemini(GEMINI_EVAL_MODEL, critique_prompt, config)
+        text = response.text.strip()
+        if text.startswith("```json"):
+            text = text[len("```json"):]
+        if text.endswith("```"):
+            text = text[:-len("```")]
+        parsed = json.loads(text.strip())
+        logger.info("Critique: %s", parsed)
+        return parsed
+    except Exception as e:
+        logger.warning("Critique failed: %s", e)
+        return {"answer_quality": "GOOD", "reasoning": f"Critique error, accepting answer: {e}"}
+
+# ---------- Full RAG pipeline: refine → search → generate → critique → retry ----------
+def run_query_pipeline(query: str, collections: List[str], chunk_limit: int, temperature: float,
+                       similarity_threshold: float, chat_history: List[Dict]) -> Dict[str, Any]:
+    """Run the full pipeline with eval-model refinement and critique loop."""
+    # Step 1: Refine query (eval model)
+    refined = refine_query(query)
+
+    current_limit = chunk_limit
+    best_response = None
+    best_chunks = None
+    best_token_info = {}
+
+    for iteration in range(1, MAX_CRITIQUE_ITERATIONS + 1):
+        # Step 2: Search
+        chunks = semantic_search(refined, collections, limit=current_limit, similarity_threshold=similarity_threshold)
+        context = _format_context(chunks)
+
+        # Step 3: Generate (main model)
+        result = generate_response(query, chunks, temperature=temperature, chat_history=chat_history)
+        best_response = result["response"]
+        best_chunks = chunks
+        best_token_info = result.get("token_info", {})
+
+        # Step 4: Critique (eval model)
+        if current_limit >= MAX_CHUNK_LIMIT or iteration >= MAX_CRITIQUE_ITERATIONS:
+            break
+
+        critique = critique_response(query, context, best_response, current_limit, iteration)
+        quality = critique.get("answer_quality", "GOOD")
+
+        if quality in ("GOOD", "ACCEPTABLE_NO_MORE_CONTEXT_NEEDED", "POOR_NO_MORE_CONTEXT_NEEDED"):
+            break
+
+        # Needs more context — expand chunks and retry
+        current_limit = min(current_limit + 5, MAX_CHUNK_LIMIT)
+        logger.info("Critique wants more context (quality=%s), retrying with %d chunks", quality, current_limit)
+
+    return {
+        "response": best_response,
+        "chunks": best_chunks,
+        "token_info": best_token_info,
+    }
 
 # ---------- Download helpers ----------
 def format_conversation_text(messages: List[Dict], include_references: bool = True) -> str:
@@ -386,12 +508,18 @@ def query_api():
     if not collections:
         return jsonify({"error": "At least one collection must be selected"}), 400
 
-    chunks = semantic_search(query, collections, limit=chunk_limit, similarity_threshold=similarity_threshold)
-    result = generate_response(query, chunks, temperature=temperature, chat_history=chat_history)
+    result = run_query_pipeline(
+        query=query,
+        collections=collections,
+        chunk_limit=chunk_limit,
+        temperature=temperature,
+        similarity_threshold=similarity_threshold,
+        chat_history=chat_history,
+    )
 
     return jsonify({
         "response": result["response"],
-        "chunks": chunks,
+        "chunks": result["chunks"],
         "token_info": result.get("token_info", {}),
     })
 
